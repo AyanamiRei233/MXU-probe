@@ -619,6 +619,18 @@ pub async fn start_tasks_impl(
             .clone();
         debug!("[start_tasks] Controller acquired");
 
+        // PROBE: 装配入口快照——实例句柄与即将绑定的对象身份
+        info!(
+            "[PROBE] start_tasks assemble: instance={} res {:p} ctrl {:p} (connected={}) \
+             stored tasker={:?} (inited={})",
+            instance_id,
+            res.raw(),
+            ctrl.raw(),
+            ctrl.connected(),
+            instance.tasker.as_ref().map(|t| t.raw()),
+            instance.tasker.as_ref().is_some_and(|t| t.inited()),
+        );
+
         // 创建或获取 tasker（若已有 tasker 但未初始化则自动丢弃并重建）
         let needs_new_tasker = match instance.tasker.as_ref() {
             None => true,
@@ -627,6 +639,10 @@ pub async fn start_tasks_impl(
         if needs_new_tasker {
             if instance.tasker.is_some() {
                 warn!("[start_tasks] Existing tasker is not initialized, discarding and rebuilding...");
+                info!(
+                    "[PROBE] discarding stale tasker {:p}",
+                    instance.tasker.as_ref().unwrap().raw()
+                );
                 instance.tasker = None;
             }
 
@@ -698,9 +714,69 @@ pub async fn start_tasks_impl(
 
     // 检查 Tasker 初始化状态
     if !tasker.inited() {
+        // PROBE: 守门失败取证——快照 vs 实例当前状态 vs 连接池 action 状态。
+        // 这是回答"销毁的是哪个对象、连接 action 当时处于什么状态"的核心证据。
+        let diag = {
+            let instances = maa_state.instances.lock().map_err(|e| e.to_string())?;
+            let instance = instances.get(&instance_id);
+            match instance {
+                Some(instance) => {
+                    let snapshot_ctrl = controller.raw();
+                    let inst_ctrl = instance.controller.as_ref().map(|c| c.raw());
+                    let same_ctrl = inst_ctrl == Some(snapshot_ctrl);
+                    let pool_diag = {
+                        let pool = maa_state
+                            .controller_pool
+                            .lock()
+                            .map_err(|e| e.to_string())?;
+                        instance
+                            .controller_config
+                            .as_ref()
+                            .and_then(|cfg| pool.get(cfg))
+                            .map(|entry| {
+                                format!(
+                                    "pool ctrl {:p} (same as snapshot={}), connected={}, \
+                                     conn_id={}, action_status={:?}",
+                                    entry.controller.raw(),
+                                    entry.controller.raw() == snapshot_ctrl,
+                                    entry.controller.connected(),
+                                    entry.connection_id,
+                                    entry.controller.status(entry.connection_id),
+                                )
+                            })
+                            .unwrap_or_else(|| "no pool entry".to_string())
+                    };
+                    format!(
+                        "snapshot: tasker {:p} (inited=false), ctrl {:p} (connected={}); \
+                         instance: ctrl {:?} (same={}), connected={}, tasker={:?} (inited={}); \
+                         request_active={}; {}",
+                        tasker.raw(),
+                        snapshot_ctrl,
+                        controller.connected(),
+                        inst_ctrl,
+                        same_ctrl,
+                        instance.controller.as_ref().is_some_and(|c| c.connected()),
+                        instance.tasker.as_ref().map(|t| t.raw()),
+                        instance.tasker.as_ref().is_some_and(|t| t.inited()),
+                        instance.controller_request.is_active(),
+                        pool_diag,
+                    )
+                }
+                None => "instance gone".to_string(),
+            }
+        };
+        error!(
+            "[PROBE] start_tasks gate failed: instance={} {}",
+            instance_id, diag
+        );
         error!("[start_tasks] Tasker not properly initialized");
         return Err("Tasker not properly initialized".to_string());
     }
+    info!(
+        "[PROBE] start_tasks gate passed: tasker {:p} ctrl {:p}",
+        tasker.raw(),
+        controller.raw()
+    );
 
     // 启动所有 Agent（如果配置了）
     debug!("[start_tasks] Checking agent configs...");

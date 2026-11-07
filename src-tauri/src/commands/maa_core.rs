@@ -333,6 +333,10 @@ fn update_instance_controller(
             .get_mut(instance_id)
             .ok_or("CONTROLLER_CONNECTION_SUPERSEDED")?;
         if !instance.controller_request.is_current(request) {
+            info!(
+                "[PROBE] update_instance_controller: instance={} SUPERSEDED (request not current)",
+                instance_id
+            );
             return Err("CONTROLLER_CONNECTION_SUPERSEDED".to_string());
         }
 
@@ -343,6 +347,30 @@ fn update_instance_controller(
         let old_controller = instance.controller.replace(controller);
         instance.controller_config = Some(new_config.clone());
         let old_tasker = instance.tasker.take();
+
+        // PROBE: 控制器替换现场——新旧句柄身份与销毁前状态快照
+        info!(
+            "[PROBE] update_instance_controller: instance={} replacing ctrl {:p} -> {:p} \
+             (old connected={})",
+            instance_id,
+            old_controller
+                .as_ref()
+                .map(|c| c.raw())
+                .unwrap_or(std::ptr::null_mut()),
+            instance
+                .controller
+                .as_ref()
+                .map(|c| c.raw())
+                .unwrap_or(std::ptr::null_mut()),
+            old_controller.as_ref().is_some_and(|c| c.connected()),
+        );
+        if let Some(t) = old_tasker.as_ref() {
+            info!(
+                "[PROBE] update_instance_controller: old_tasker {:p} inited={} (pre-drop)",
+                t.raw(),
+                t.inited()
+            );
+        }
 
         // Subscription changes and instance replacement/destroy share the instances lock.
         if let Some(old_subscribers) = old_subscribers {
@@ -360,14 +388,38 @@ fn update_instance_controller(
         });
         if let Some(old_cfg) = cleanup_config {
             let mut pool = state.controller_pool.lock().map_err(|e| e.to_string())?;
+            if let Some(entry) = pool.get(&old_cfg) {
+                info!(
+                    "[PROBE] ControllerPool: removing entry for old config (ctrl {:p}, conn_id={}, \
+                     last action status={:?})",
+                    entry.controller.raw(),
+                    entry.connection_id,
+                    entry.controller.status(entry.connection_id)
+                );
+            }
             pool.remove(&old_cfg);
             info!("ControllerPool: removed unused entry for old config");
         }
         (old_controller, old_tasker)
     };
     // Native handle destruction may wait for callbacks which acquire instances.
+    // PROBE: drop 前后各打一行——与 maafw.log 的 MaaControllerDestroy 对齐销毁对象
+    if let Some(t) = old_tasker.as_ref() {
+        info!(
+            "[PROBE] dropping old_tasker {:p} (native destroy may follow)",
+            t.raw()
+        );
+    }
     drop(old_tasker);
+    if let Some(c) = old_controller.as_ref() {
+        info!(
+            "[PROBE] dropping old_controller {:p} connected={} (native destroy may follow)",
+            c.raw(),
+            c.connected()
+        );
+    }
     drop(old_controller);
+    info!("[PROBE] update_instance_controller: drops completed");
 
     Ok(())
 }
@@ -378,12 +430,25 @@ fn begin_controller_connection(
 ) -> Result<CallbackGuard, String> {
     let mut instances = state.instances.lock().map_err(|e| e.to_string())?;
     let instance = instances.get_mut(instance_id).ok_or("Instance not found")?;
+    // PROBE: 连接请求交接——旧请求是否仍活跃、实例当前 ctrl/tasker 句柄
+    info!(
+        "[PROBE] begin_controller_connection: instance={} cancelling previous request \
+         (still active={}), current ctrl={:?}, tasker={:?}",
+        instance_id,
+        instance.controller_request.is_active(),
+        instance.controller.as_ref().map(|c| c.raw()),
+        instance.tasker.as_ref().map(|t| t.raw()),
+    );
     instance.controller_request.cancel();
     if let Some(subscribers) = instance.controller_subscribers.take() {
         subscribers.unsubscribe(instance_id);
     }
     let request = CallbackGuard::default();
     instance.controller_request = request.clone();
+    info!(
+        "[PROBE] begin_controller_connection: instance={} new request active",
+        instance_id
+    );
     Ok(request)
 }
 
@@ -405,6 +470,13 @@ fn publish_controller_connection(
         return Err("CONTROLLER_CONNECTION_SUPERSEDED".to_string());
     }
     let mut pool = state.controller_pool.lock().map_err(|e| e.to_string())?;
+    info!(
+        "[PROBE] publish_controller_connection: instance={} conn_id={} ctrl {:p} (request current={})",
+        instance_id,
+        connection_id,
+        controller.raw(),
+        instance.controller_request.is_current(request),
+    );
     pool.insert(
         config,
         super::types::ControllerPoolEntry {
@@ -505,6 +577,23 @@ pub fn maa_init(state: State<Arc<MaaState>>, lib_dir: Option<String>) -> Result<
 
     let version = maa_framework::maa_version().to_string();
     info!("maa_init success, version: {}", version);
+
+    // PROBE: 取证构建标识——原生 MaaFW 版本 / Rust binding 版本 / git rev / 目标三元组
+    let git_rev = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    info!(
+        "[PROBE] build identity: branch=debug/controller-lifetime-probe git={} \
+         maafw_native={} maafw_binding=1.27.0(Cargo.lock) arch={}",
+        git_rev,
+        version,
+        std::env::consts::ARCH,
+    );
 
     Ok(version)
 }
@@ -811,6 +900,17 @@ pub fn destroy_instance_impl(state: &Arc<MaaState>, instance_id: &str) -> Result
         let mut instances = state.instances.lock().map_err(|e| e.to_string())?;
         let removed = instances.remove(instance_id);
         if let Some(instance) = &removed {
+            // PROBE: 实例销毁现场——句柄身份快照
+            info!(
+                "[PROBE] destroy_instance: instance={} ctrl={:?} connected={} tasker={:?} inited={} \
+                 res={:?}",
+                instance_id,
+                instance.controller.as_ref().map(|c| c.raw()),
+                instance.controller.as_ref().is_some_and(|c| c.connected()),
+                instance.tasker.as_ref().map(|t| t.raw()),
+                instance.tasker.as_ref().is_some_and(|t| t.inited()),
+                instance.resource.as_ref().map(|r| r.raw()),
+            );
             // Retire the old completion worker before this ID can be reused.
             instance.run_completion.retire();
             // Cancel before allowing the same ID to be created again. A callback snapshot
@@ -897,6 +997,11 @@ pub async fn connect_controller_impl(
     let cleanup_request = request.clone();
     let result = tokio::task::spawn_blocking(move || {
         let _connection = connection_gate.lock().map_err(|e| e.to_string())?;
+        info!(
+            "[PROBE] connect worker: instance={} gate acquired, request active={}",
+            instance_id,
+            request.is_active()
+        );
         if !request.is_active() {
             return Err("CONTROLLER_CONNECTION_SUPERSEDED".to_string());
         }
@@ -906,21 +1011,43 @@ pub async fn connect_controller_impl(
                 .controller_pool
                 .lock()
                 .map_err(|e| e.to_string())?;
-            pool.get(&config)
-                .filter(|entry| {
-                    entry.controller.connected()
-                        || matches!(
-                            entry.controller.status(entry.connection_id),
-                            MaaStatus::PENDING | MaaStatus::RUNNING
-                        )
-                })
-                .cloned()
+            let hit = pool.get(&config);
+            if let Some(entry) = hit {
+                info!(
+                    "[PROBE] pool lookup: instance={} found ctrl {:p} connected={} \
+                     conn_id={} action_status={:?}",
+                    instance_id,
+                    entry.controller.raw(),
+                    entry.controller.connected(),
+                    entry.connection_id,
+                    entry.controller.status(entry.connection_id),
+                );
+            } else {
+                info!(
+                    "[PROBE] pool lookup: instance={} no entry for config",
+                    instance_id
+                );
+            }
+            hit.filter(|entry| {
+                entry.controller.connected()
+                    || matches!(
+                        entry.controller.status(entry.connection_id),
+                        MaaStatus::PENDING | MaaStatus::RUNNING
+                    )
+            })
+            .cloned()
         };
 
         if let Some(pooled_ctrl) = pooled {
             info!(
                 "ControllerPool hit: reusing connected controller for {:?}",
                 config
+            );
+            info!(
+                "[PROBE] pool hit path: instance={} ctrl {:p} connected={} (repost pending conn)",
+                instance_id,
+                pooled_ctrl.controller.raw(),
+                pooled_ctrl.controller.connected(),
             );
 
             update_instance_controller(
@@ -948,6 +1075,11 @@ pub async fn connect_controller_impl(
                 .controller
                 .post_connection()
                 .map_err(|e| e.to_string())?;
+            info!(
+                "[PROBE] reposted connection on pooled ctrl {:p}: conn_id={}",
+                pooled_ctrl.controller.raw(),
+                conn_id
+            );
             publish_controller_connection(
                 &state_arc,
                 &instance_id,
@@ -1124,6 +1256,14 @@ pub async fn connect_controller_impl(
 
         config.display_options().apply(&controller)?;
 
+        // PROBE: 新建控制器完成——句柄身份（对应 maafw MaaAdbControllerCreate）
+        info!(
+            "[PROBE] controller built: instance={} new ctrl {:p} connected={}",
+            instance_id,
+            controller.raw(),
+            controller.connected(),
+        );
+
         // Install the subscription before posting, so fast callbacks cannot be lost.
         update_instance_controller(
             &state_arc,
@@ -1135,6 +1275,12 @@ pub async fn connect_controller_impl(
             on_event,
         )?;
         let conn_id = controller.post_connection().map_err(|e| e.to_string())?;
+        info!(
+            "[PROBE] connection posted: instance={} ctrl {:p} conn_id={} (async, PENDING now)",
+            instance_id,
+            controller.raw(),
+            conn_id,
+        );
         publish_controller_connection(
             &state_arc,
             &instance_id,
@@ -1151,6 +1297,11 @@ pub async fn connect_controller_impl(
     .map_err(|e| e.to_string())
     .and_then(|result| result);
     if result.is_err() {
+        info!(
+            "[PROBE] connect worker failed: instance={} err={:?} (cleanup may cancel request)",
+            cleanup_instance_id,
+            result.as_ref().err(),
+        );
         if let Ok(mut instances) = cleanup_state.instances.lock() {
             if let Some(instance) = instances.get_mut(&cleanup_instance_id) {
                 if instance.controller_request.is_current(&cleanup_request) {
@@ -1562,6 +1713,15 @@ pub fn run_task_impl(
         tasker
             .bind(resource, controller)
             .map_err(|e| e.to_string())?;
+        info!(
+            "[PROBE] run_task rebuild: instance={} new tasker {:p} bound to ctrl {:p} \
+             (connected={}), res {:p}",
+            instance_id,
+            tasker.raw(),
+            controller.raw(),
+            controller.connected(),
+            resource.raw(),
+        );
 
         instance.tasker = Some(tasker);
     }
@@ -1569,6 +1729,22 @@ pub fn run_task_impl(
     let tasker = instance.tasker.as_ref().unwrap();
 
     if !tasker.inited() {
+        // PROBE: 直接任务路径守门失败取证（对照 start_tasks）
+        error!(
+            "[PROBE] run_task gate failed: instance={} tasker {:p} inited=false, ctrl {:p} \
+             connected={}, pool action={:?}",
+            instance_id,
+            tasker.raw(),
+            controller.raw(),
+            controller.connected(),
+            {
+                let cfg = instance.controller_config.clone();
+                let pool = state.controller_pool.lock().map_err(|e| e.to_string())?;
+                cfg.as_ref()
+                    .and_then(|c| pool.get(c))
+                    .map(|entry| entry.controller.status(entry.connection_id))
+            },
+        );
         return Err("Tasker not initialized even after rebuild".to_string());
     }
 
